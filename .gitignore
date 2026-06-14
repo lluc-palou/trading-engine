@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# Runtime state and logs
+state/
+logs/
+data/*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

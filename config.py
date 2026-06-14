@@ -1,0 +1,78 @@
+"""
+Trading engine configuration — environment-driven settings for the Bybit API,
+instrument parameters, and execution controls.
+
+All secrets are loaded from environment variables (BYBIT_API_KEY, BYBIT_API_SECRET).
+A .env file at the project root is supported via python-dotenv and takes precedence
+over system-level environment variables during local development.
+"""
+
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env file from the project root when present
+load_dotenv(Path(__file__).parent / ".env")
+
+# ── Bybit API credentials ────────────────────────────────────────────────────
+BYBIT_API_KEY: str = os.environ.get("BYBIT_API_KEY", "")
+BYBIT_API_SECRET: str = os.environ.get("BYBIT_API_SECRET", "")
+BYBIT_BASE_URL: str = "https://api.bybit.com"
+
+# ── Instrument ───────────────────────────────────────────────────────────────
+SYMBOL: str = "BTCUSDT"
+CATEGORY: str = "linear"  # USDT-settled perpetual futures
+INTERVAL: str = "60"      # Bybit interval notation for 1H (minutes as string)
+INTERVAL_MS: int = 3_600_000  # 1 hour expressed in milliseconds
+
+# ── Execution and risk controls ──────────────────────────────────────────────
+# Exchange leverage applied to every order and set on the account.
+LEVERAGE: int = 5
+
+# Fraction of total wallet balance committed as margin per trade.
+# At LEVERAGE=5, CAPITAL_FRACTION=1.0 posts the full account as margin and
+# controls a 5× notional — the combination that targets P(ruin −20%) ≈ 10%.
+CAPITAL_FRACTION: float = 1.0
+
+MAX_ACTIVE_POSITIONS: int = 1  # One trade at a time — justified by signal frequency (~59/year)
+
+# ── Project paths ────────────────────────────────────────────────────────────
+PROJECT_ROOT: Path = Path(__file__).parent
+DATA_DIR: Path = PROJECT_ROOT / "data"
+STATE_DIR: Path = PROJECT_ROOT / "state"
+LOGS_DIR: Path = PROJECT_ROOT / "logs"
+
+# Ensure all runtime directories exist on first import
+for _runtime_dir in (DATA_DIR, STATE_DIR, LOGS_DIR):
+    _runtime_dir.mkdir(parents=True, exist_ok=True)
+
+# ── Cache ────────────────────────────────────────────────────────────────────
+CACHE_FILE: Path = DATA_DIR / "btcusdt_1h.parquet"
+
+# ── Bybit BTCUSDT linear perpetual listing origin ────────────────────────────
+# BTCUSDT USDT-settled perpetual launched on Bybit around 2019-10-01.
+BYBIT_ORIGIN_MS: int = 1_569_888_000_000
+
+# ── Risk guard thresholds ────────────────────────────────────────────────────
+# Minimum account equity to attempt a trade. Set to 0 — the real gate is the
+# qty viability check in guard.py (_check_qty_viability), which blocks the order
+# if the computed BTC quantity is below the exchange minimum step (0.001 BTC).
+# Any non-empty account that can fund at least one minimum lot is tradeable.
+MIN_CAPITAL_USDT: float = 0.0
+
+# Halt trading if equity drops more than this fraction from the recorded peak equity.
+# At 35% drawdown the strategy edge is likely compromised or conditions have changed.
+MAX_DRAWDOWN_PCT: float = 0.35
+
+# SL must sit at least this far (as a fraction of entry price) above the estimated
+# liquidation price to ensure the stop fires before the position is liquidated.
+MIN_LIQUIDATION_BUFFER_PCT: float = 0.05
+
+# ── Orchestrator timing ──────────────────────────────────────────────────────
+# Run the detection cycle this many minutes after each hourly candle close (H:00 UTC).
+# 3 minutes gives Bybit time to finalise and serve the just-closed candle.
+WAKEUP_OFFSET_MINUTES: int = 3
+
+# ── Capital state ────────────────────────────────────────────────────────────
+CAPITAL_STATE_FILE: Path = STATE_DIR / "capital.json"
