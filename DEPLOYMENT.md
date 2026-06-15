@@ -6,6 +6,13 @@
 - SSH key pair on your local machine
 - Python 3.11+ and Git (installed automatically via apt on the VM)
 
+> **Security note — read before doing anything else:**
+> The single most important security control in this deployment is the **Bybit API key IP whitelist**.
+> The `.env` file on the server holds your API keys. If the server were ever compromised, those keys
+> could be used to trade your account. With an IP whitelist set to your VM's public IP, the keys are
+> useless from any other machine — even if leaked. **Do not create Bybit API keys without setting the
+> IP restriction.** You will need the VM's IP address first (step 0b), then create the keys (step 2).
+
 ---
 
 ## 0. Provision and harden the VM
