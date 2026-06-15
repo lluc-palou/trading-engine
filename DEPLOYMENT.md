@@ -2,9 +2,105 @@
 
 ## Prerequisites
 
-- Ubuntu 24.04 LTS VM — 1 vCPU, 1 GB RAM minimum (Hetzner CX11 €4/mo, DigitalOcean Droplet $6/mo, AWS t3.micro $8/mo)
-- Python 3.11+
-- Git
+- Hetzner account — [console.hetzner.cloud](https://console.hetzner.cloud)
+- SSH key pair on your local machine
+- Python 3.11+ and Git (installed automatically via apt on the VM)
+
+---
+
+## 0. Provision and harden the VM
+
+### 0a. Generate an SSH key (local machine — skip if you already have one)
+
+```bash
+ssh-keygen -t ed25519 -C "trading-engine"
+# Press Enter for default path (~/.ssh/id_ed25519), set a passphrase
+cat ~/.ssh/id_ed25519.pub   # copy this output
+```
+
+### 0b. Create the server on Hetzner
+
+1. Log in to [console.hetzner.cloud](https://console.hetzner.cloud) → **New Project** → name it `trading-engine`
+2. Inside the project → **Add Server**
+3. **Location**: any EU location (Nuremberg, Falkenstein, Helsinki)
+4. **Image**: Ubuntu 24.04 LTS
+5. **Type**: Shared CPU → **CX11** (2 vCPU, 2 GB RAM, 20 GB SSD — €4.51/mo)
+6. **SSH Keys**: click Add SSH Key → paste your `id_ed25519.pub` content → name it
+7. **Firewall**: create a new firewall named `trading-engine-fw`:
+   - Inbound rule: TCP port 22 (SSH) — your local IP only if you have a static IP, otherwise `0.0.0.0/0`
+   - Inbound rule: delete the default ICMP rule if present (optional, not critical)
+   - Outbound: leave default (allow all — the engine needs HTTPS to Bybit and Telegram)
+8. Leave everything else default → **Create & Buy**
+9. Copy the server's public IP from the dashboard
+
+### 0c. First login and system update
+
+```bash
+ssh root@<SERVER_IP>
+apt update && apt upgrade -y
+```
+
+### 0d. Create a non-root user
+
+```bash
+adduser ubuntu               # set a strong password when prompted
+usermod -aG sudo ubuntu
+
+# Copy SSH keys from root to the new user
+rsync --archive --chown=ubuntu:ubuntu ~/.ssh /home/ubuntu
+```
+
+### 0e. Harden SSH
+
+```bash
+nano /etc/ssh/sshd_config
+```
+
+Find and set (or add) these lines:
+```
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+```
+
+```bash
+systemctl restart ssh
+```
+
+Open a **second terminal** and verify you can SSH as ubuntu before closing the root session:
+```bash
+# in the new terminal on your local machine
+ssh ubuntu@<SERVER_IP>
+```
+
+### 0f. Set up UFW firewall
+
+```bash
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp
+ufw enable
+ufw status
+```
+
+Expected output:
+```
+Status: active
+To                Action    From
+--                ------    ----
+22/tcp            ALLOW     Anywhere
+```
+
+The engine makes only outbound HTTPS calls (Bybit + Telegram). No inbound ports are needed beyond SSH.
+
+### 0g. Install Python and Git
+
+Ubuntu 24.04 ships with Python 3.12. Verify:
+
+```bash
+python3 --version    # should print Python 3.12.x
+sudo apt install -y git python3-venv python3-pip
+```
 
 ---
 
@@ -23,6 +119,7 @@ python3 -m venv .venv
 
 ```bash
 cp .env.example .env
+chmod 600 .env       # restrict to owner-read only — no other user can read it
 nano .env
 ```
 
@@ -35,14 +132,20 @@ TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
 ```
 
+**Bybit API keys:**
+Account → API Management → Create New Key:
+- Type: **System-generated**
+- Permissions: **Read** + **Derivatives** (Trade) only — do NOT enable Wallet or Withdrawal
+- IP Access: **Restrict to IP** → enter your VM's public IP
+- Copy the key and secret immediately (secret shown only once)
+
+The IP restriction is the most important security measure: even if the key is leaked, it cannot be used from any other machine.
+
 **Getting your Telegram chat ID:**
 1. Create a bot via [@BotFather](https://t.me/BotFather) → `/newbot` → copy the token
 2. Open your new bot in Telegram and send it any message
 3. Open `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates` in a browser
 4. Copy the `id` value inside `"chat"` from the response
-
-**Bybit API keys:**
-Create keys at Account → API Management. Required permissions: Read + Trade (Derivatives). IP whitelist your VM's IP for security.
 
 ---
 
