@@ -36,6 +36,7 @@ Notifications are exactly three event types:
 """
 
 import logging
+import logging.handlers
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -79,8 +80,9 @@ def setup_logging(log_file_path: Optional[str] = None) -> None:
     """
     Configures the root logger with a UTC-timestamped formatter.
 
-    Attaches a StreamHandler (stdout) always, and a FileHandler when log_file_path
-    is provided. Log level is INFO for both handlers.
+    Attaches a StreamHandler (stdout) always, and a TimedRotatingFileHandler
+    when log_file_path is provided. Log files rotate daily and the last 30
+    days are kept, after which older files are deleted automatically.
 
     Args:
         log_file_path: Optional absolute path to the log file. When None, only
@@ -98,7 +100,13 @@ def setup_logging(log_file_path: Optional[str] = None) -> None:
     root_logger.addHandler(stream_handler)
 
     if log_file_path:
-        file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
+        file_handler = logging.handlers.TimedRotatingFileHandler(
+            log_file_path,
+            when="midnight",
+            utc=True,
+            backupCount=30,
+            encoding="utf-8",
+        )
         file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
 

@@ -1,0 +1,27 @@
+[Unit]
+Description=Momentum-exhaustion-reversal trading engine (Bybit BTCUSDT)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# --- adjust these three lines to match your VM setup ---
+User=ubuntu
+WorkingDirectory=/home/ubuntu/trading-engine
+ExecStart=/home/ubuntu/trading-engine/.venv/bin/python run.py
+# --------------------------------------------------------
+
+Restart=on-failure
+RestartSec=60
+
+# Give the engine 30 s to shut down cleanly on SIGTERM before SIGKILL
+TimeoutStopSec=30
+
+# Stream stdout/stderr into journald (use: journalctl -u trading-engine -f)
+StandardOutput=journal
+StandardError=journal
+
+# The engine writes its own logs to logs/trading.log (daily rotation, 30 days)
+# journald is a secondary copy useful for crash inspection
+
+[Install]
+WantedBy=multi-user.target
