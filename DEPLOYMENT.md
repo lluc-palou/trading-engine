@@ -31,7 +31,7 @@ cat ~/.ssh/id_ed25519.pub   # copy this output
 2. Inside the project → **Add Server**
 3. **Location**: any EU location (Nuremberg, Falkenstein, Helsinki)
 4. **Image**: Ubuntu 24.04 LTS
-5. **Type**: Shared CPU → **CX11** (2 vCPU, 2 GB RAM, 20 GB SSD — €4.51/mo)
+5. **Type**: Shared CPU → **CX22** (2 vCPU, 4 GB RAM, 40 GB SSD — €6.64/mo)
 6. **SSH Keys**: click Add SSH Key → paste your `id_ed25519.pub` content → name it
 7. **Firewall**: create a new firewall named `trading-engine-fw`:
    - Inbound rule: TCP port 22 (SSH) — your local IP only if you have a static IP, otherwise `0.0.0.0/0`
