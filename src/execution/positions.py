@@ -87,6 +87,57 @@ def get_open_position(symbol: str = SYMBOL, timeout: int = 10) -> Optional[Dict]
     return None
 
 
+def get_closing_execution(
+    direction: str,
+    entry_time_ms: int,
+    symbol: str = SYMBOL,
+    timeout: int = 10,
+) -> Optional[Dict]:
+    """
+    Returns the most recent closing trade execution that occurred after entry_time_ms.
+
+    Queries the Bybit execution history and returns the first Trade-type fill with
+    the side opposite to the entry direction that happened after the entry timestamp.
+    Used by the orchestrator to identify which leg (TP or SL) fired and to obtain
+    the actual fill price for P&L calculation.
+
+    Args:
+        direction:     "long" or "short" of the position that closed.
+        entry_time_ms: Entry timestamp in milliseconds (Unix epoch, UTC).
+        symbol:        Trading pair symbol.
+        timeout:       HTTP request timeout in seconds.
+
+    Returns:
+        Execution dict with execPrice, execQty, execTime, and side fields;
+        or None if no matching execution is found within the last 10 fills.
+
+    Raises:
+        ValueError: On Bybit API error.
+        requests.HTTPError: On HTTP-level failure.
+    """
+    closing_side = "Sell" if direction == "long" else "Buy"
+
+    response = signed_get(
+        "/v5/execution/list",
+        params={
+            "category": CATEGORY,
+            "symbol":   symbol,
+            "limit":    10,
+            "execType": "Trade",
+        },
+        timeout=timeout,
+    )
+
+    for execution in response["result"]["list"]:
+        if (
+            execution.get("side") == closing_side
+            and int(execution.get("execTime", 0)) > entry_time_ms
+        ):
+            return execution
+
+    return None
+
+
 def is_position_open(symbol: str = SYMBOL, timeout: int = 10) -> bool:
     """
     Returns True if there is an active open position for the symbol on Bybit.

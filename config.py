@@ -77,8 +77,8 @@ MIN_LIQUIDATION_BUFFER_PCT: float = 0.05
 
 # ── Orchestrator timing ──────────────────────────────────────────────────────
 # Run the detection cycle this many minutes after each hourly candle close (H:00 UTC).
-# 3 minutes gives Bybit time to finalise and serve the just-closed candle.
-WAKEUP_OFFSET_MINUTES: int = 3
+# 1 minute is enough for Bybit to finalise the candle and minimises entry price drift.
+WAKEUP_OFFSET_MINUTES: int = 1
 
 # ── Capital state ────────────────────────────────────────────────────────────
 CAPITAL_STATE_FILE: Path = STATE_DIR / "capital.json"
