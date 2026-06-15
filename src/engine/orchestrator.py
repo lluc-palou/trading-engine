@@ -519,8 +519,8 @@ def run_once(
         )
         return
 
-    # Step 2b: Bybit-side position guard (live and dry-run only — paper has no real positions)
-    if not paper_mode and get_open_position(symbol=SYMBOL) is not None:
+    # Step 2b: Bybit-side position guard (live only — paper and dry-run never open positions)
+    if not paper_mode and not dry_run and get_open_position(symbol=SYMBOL) is not None:
         logger.warning(
             "[POSITION_GUARD] Open position on Bybit but no local state found. "
             "Skipping new entry until the exchange position clears or is reconciled."
