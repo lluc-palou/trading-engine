@@ -67,11 +67,11 @@ def save_active_position(
     entry_price: float,
     tp_price: float,
     sl_price: float,
-    bybit_order_id: str,
-    qty_btc: float,
-    position_notional: float,
-    margin_usdt: float,
-    risk_amount_usdt: float,
+    bybit_order_id: str = "PENDING",
+    qty_btc: float = 0.0,
+    position_notional: float = 0.0,
+    margin_usdt: float = 0.0,
+    risk_amount_usdt: float = 0.0,
 ) -> None:
     """
     Writes a new active position to the state file, computing the exit deadline.
@@ -118,6 +118,29 @@ def save_active_position(
     POSITIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(POSITIONS_FILE, "w", encoding="utf-8") as file_handle:
         json.dump(state, file_handle, indent=2)
+
+
+def patch_order_id(order_id: str) -> None:
+    """
+    Updates bybit_order_id in the state file after a successful order placement.
+
+    Called immediately after place_entry_order() to replace the "PENDING" placeholder
+    written before order placement. Reads the current state, updates only the
+    bybit_order_id field, and writes back atomically.
+
+    Args:
+        order_id: The order ID returned by Bybit for the market entry order.
+    """
+    if not POSITIONS_FILE.exists():
+        return
+
+    with open(POSITIONS_FILE, "r", encoding="utf-8") as fh:
+        state = json.load(fh)
+
+    state["bybit_order_id"] = order_id
+
+    with open(POSITIONS_FILE, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2)
 
 
 def clear_active_position() -> None:

@@ -7,6 +7,9 @@ Usage:
     python run.py --dry-run      # Detection and sizing only — no orders placed
     python run.py --now --dry-run
 
+Notifications are sent via Telegram when TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+are set in .env. If either is missing the engine runs silently with no notifications.
+
 Logs are written to both stdout and logs/trading.log.
 """
 
@@ -17,18 +20,18 @@ from pathlib import Path
 # Make the project root importable from any working directory
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import LOGS_DIR
+from config import LOGS_DIR, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 from src.engine.orchestrator import run_forever, run_once, setup_logging
 from src.notifications.stub import StubNotifier
+from src.notifications.telegram import build_notifier
 
 
 def main() -> None:
     """
-    Parses CLI arguments, configures logging, and starts the orchestrator.
+    Parses CLI arguments, selects the notification backend, and starts the orchestrator.
 
-    Uses StubNotifier by default (no-op). To enable real notifications swap
-    StubNotifier for a concrete backend (e.g. TelegramNotifier) once Phase 4
-    is implemented.
+    Uses TelegramNotifier when TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set in
+    the environment; falls back to StubNotifier (no-op) otherwise.
     """
     parser = argparse.ArgumentParser(
         description="Momentum-exhaustion-reversal trading engine — Bybit BTCUSDT perpetual."
@@ -46,11 +49,18 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Configure logging to stdout and file
     log_file = str(LOGS_DIR / "trading.log")
     setup_logging(log_file_path=log_file)
 
-    notifier = StubNotifier()
+    import logging
+    logger = logging.getLogger(__name__)
+
+    notifier = build_notifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+    if notifier is None:
+        notifier = StubNotifier()
+        logger.info("[NOTIFIER] Telegram credentials not set — running without notifications.")
+    else:
+        logger.info("[NOTIFIER] Telegram notifications enabled.")
 
     if args.now:
         run_once(notifier=notifier, dry_run=args.dry_run)

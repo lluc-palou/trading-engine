@@ -20,6 +20,12 @@ BYBIT_API_KEY: str = os.environ.get("BYBIT_API_KEY", "")
 BYBIT_API_SECRET: str = os.environ.get("BYBIT_API_SECRET", "")
 BYBIT_BASE_URL: str = "https://api.bybit.com"
 
+# ── Telegram notifications ───────────────────────────────────────────────────
+# Set both variables to enable Telegram alerts (TRADE_OPENED / TRADE_CLOSED / ERROR).
+# If either is empty the engine falls back to the no-op StubNotifier silently.
+TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID: str = os.environ.get("TELEGRAM_CHAT_ID", "")
+
 # ── Instrument ───────────────────────────────────────────────────────────────
 SYMBOL: str = "BTCUSDT"
 CATEGORY: str = "linear"  # USDT-settled perpetual futures
