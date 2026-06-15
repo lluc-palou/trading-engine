@@ -43,28 +43,24 @@ CAPITAL_FRACTION: float = 1.0
 
 MAX_ACTIVE_POSITIONS: int = 1  # One trade at a time — justified by signal frequency (~59/year)
 
+# ── Paper mode ───────────────────────────────────────────────────────────────
+# Simulated capital used when running with --paper (no real funds committed).
+# Sizing and notifications reflect this amount; no orders are placed on Bybit.
+PAPER_CAPITAL_USDT: float = 1_000.0
+
 # ── Project paths ────────────────────────────────────────────────────────────
 PROJECT_ROOT: Path = Path(__file__).parent
-DATA_DIR: Path = PROJECT_ROOT / "data"
 STATE_DIR: Path = PROJECT_ROOT / "state"
 LOGS_DIR: Path = PROJECT_ROOT / "logs"
 
-# Ensure all runtime directories exist on first import
-for _runtime_dir in (DATA_DIR, STATE_DIR, LOGS_DIR):
+# Ensure runtime directories exist on first import
+for _runtime_dir in (STATE_DIR, LOGS_DIR):
     _runtime_dir.mkdir(parents=True, exist_ok=True)
-
-# ── Cache ────────────────────────────────────────────────────────────────────
-CACHE_FILE: Path = DATA_DIR / "btcusdt_1h.parquet"
-
-# ── Bybit BTCUSDT linear perpetual listing origin ────────────────────────────
-# BTCUSDT USDT-settled perpetual launched on Bybit around 2019-10-01.
-BYBIT_ORIGIN_MS: int = 1_569_888_000_000
 
 # ── Risk guard thresholds ────────────────────────────────────────────────────
 # Minimum account equity to attempt a trade. Set to 0 — the real gate is the
 # qty viability check in guard.py (_check_qty_viability), which blocks the order
 # if the computed BTC quantity is below the exchange minimum step (0.001 BTC).
-# Any non-empty account that can fund at least one minimum lot is tradeable.
 MIN_CAPITAL_USDT: float = 0.0
 
 # Halt trading if equity drops more than this fraction from the recorded peak equity.

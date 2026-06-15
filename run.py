@@ -1,23 +1,27 @@
 """
 Trading engine entry point — parses CLI arguments and starts the orchestrator loop.
 
-Usage:
-    python run.py                # Follow the H:03 UTC schedule (production mode)
-    python run.py --now          # Run one cycle immediately, then follow the schedule
-    python run.py --dry-run      # Detection and sizing only — no orders placed
-    python run.py --now --dry-run
+Modes:
+    (none)       Live trading — places real orders, full notifications.
+    --dry-run    Detection and sizing only — no orders, no notifications, no state.
+    --paper      Full pipeline with simulated trades — no real orders, full
+                 notifications prefixed with [PAPER]. Use this to validate the
+                 complete wakeup / signal / notification cycle before deploying capital.
+
+Flags:
+    --now        Run one detection cycle immediately before entering the scheduled loop.
 
 Notifications are sent via Telegram when TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
-are set in .env. If either is missing the engine runs silently with no notifications.
+are set in .env. If either is missing the engine runs without notifications.
 
-Logs are written to both stdout and logs/trading.log.
+Logs are written to both stdout and logs/trading.log (daily rotation, kept forever).
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
-# Make the project root importable from any working directory
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import LOGS_DIR, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -25,14 +29,10 @@ from src.engine.orchestrator import run_forever, run_once, setup_logging
 from src.notifications.stub import StubNotifier
 from src.notifications.telegram import build_notifier
 
+logger = logging.getLogger(__name__)
+
 
 def main() -> None:
-    """
-    Parses CLI arguments, selects the notification backend, and starts the orchestrator.
-
-    Uses TelegramNotifier when TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set in
-    the environment; falls back to StubNotifier (no-op) otherwise.
-    """
     parser = argparse.ArgumentParser(
         description="Momentum-exhaustion-reversal trading engine — Bybit BTCUSDT perpetual."
     )
@@ -45,15 +45,26 @@ def main() -> None:
         "--dry-run",
         action="store_true",
         dest="dry_run",
-        help="Run detection and sizing without placing any orders or writing state.",
+        help="Detection and sizing only — no orders, no state, no notifications.",
+    )
+    parser.add_argument(
+        "--paper",
+        action="store_true",
+        dest="paper_mode",
+        help=(
+            "Full pipeline with simulated trades — no real orders placed. "
+            "Uses PAPER_CAPITAL_USDT for sizing. All Telegram notifications fire "
+            "with a [PAPER] prefix. Use to validate deployment before live capital."
+        ),
     )
     args = parser.parse_args()
 
+    if args.dry_run and args.paper_mode:
+        print("Error: --dry-run and --paper are mutually exclusive.", file=sys.stderr)
+        sys.exit(1)
+
     log_file = str(LOGS_DIR / "trading.log")
     setup_logging(log_file_path=log_file)
-
-    import logging
-    logger = logging.getLogger(__name__)
 
     notifier = build_notifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
     if notifier is None:
@@ -63,9 +74,9 @@ def main() -> None:
         logger.info("[NOTIFIER] Telegram notifications enabled.")
 
     if args.now:
-        run_once(notifier=notifier, dry_run=args.dry_run)
+        run_once(notifier=notifier, dry_run=args.dry_run, paper_mode=args.paper_mode)
 
-    run_forever(notifier=notifier, dry_run=args.dry_run)
+    run_forever(notifier=notifier, dry_run=args.dry_run, paper_mode=args.paper_mode)
 
 
 if __name__ == "__main__":

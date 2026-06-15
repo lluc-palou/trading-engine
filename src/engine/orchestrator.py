@@ -8,31 +8,38 @@ Each cycle follows this sequence:
 
     1. Fetch latest 1H candles from Bybit and compute indicators.
     2. If an active position is recorded in local state:
-           a. Verify the position is still open on Bybit.
-              - If NOT open: TP or SL was triggered server-side.
-                Query execution history to identify the leg and fill price,
-                compute realised P&L, clear local state, send TRADE_CLOSED.
-           b. If OPEN and the hold-window deadline has passed:
-                Cancel any residual TP/SL orders, execute a market close,
-                query the fill price, compute P&L, clear state, send TRADE_CLOSED.
-           c. If OPEN and deadline has not passed: log remaining time and exit.
+           a. Verify the position is still open on Bybit (live) or check price
+              against TP/SL levels (paper). If closed: query fill, compute P&L,
+              clear state, send TRADE_CLOSED.
+           b. If OPEN and the hold-window deadline has passed: cancel brackets,
+              close at market (live) or use current price (paper), clear state,
+              send TRADE_CLOSED.
+           c. If OPEN and deadline not passed: log remaining time, exit.
     3. If no active position, run signal detection on the last closed candle.
     4. If a signal is active (entry bar == last bar):
-           a. Fetch live wallet balance as the capital input for sizing.
+           a. Fetch live wallet balance (live) or use PAPER_CAPITAL_USDT (paper).
            b. Compute sizing (notional, TP, SL, hold hours).
-           c. Run all pre-trade risk guard checks.
-           d. Write pending state to disk (bybit_order_id="PENDING") so the
-              exit deadline survives a crash in the gap before step e.
-           e. Place the market entry order with TP/SL bracket on Bybit.
-           f. Patch state with the real Bybit order ID.
+           c. Run all pre-trade risk guard checks (skipped in paper mode).
+           d. Write pending state (bybit_order_id="PENDING" or "PAPER") before
+              placing the order, so the exit deadline survives a crash.
+           e. Place the market entry order with TP/SL bracket (live only).
+           f. Patch state with the real order ID (live) or "PAPER_TRADE" (paper).
            g. Send TRADE_OPENED notification.
 
 Notifications are exactly three event types:
-    TRADE_OPENED — fired once when the entry order lands on Bybit.
+    TRADE_OPENED — fired once when the entry order lands on Bybit (or is
+                   simulated in paper mode).
     TRADE_CLOSED — fired when the position closes (TP, SL, or time exit);
                    includes fill price, identified leg, and realised P&L.
     ERROR        — fired for guard blocks (with equity/drawdown context),
                    stale state, or unhandled exceptions.
+
+Paper mode (--paper flag):
+    Runs the full pipeline — detection, sizing, state management, notifications —
+    but places no orders on Bybit. Uses PAPER_CAPITAL_USDT from config as the
+    simulated account size. Notifications are prefixed with [PAPER]. TP/SL
+    simulation is based on the last closed candle's price. Use this to validate
+    the complete notification cycle and wakeup schedule before deploying capital.
 """
 
 import logging
@@ -42,7 +49,13 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
-from config import CAPITAL_FRACTION, LEVERAGE, SYMBOL, WAKEUP_OFFSET_MINUTES
+from config import (
+    CAPITAL_FRACTION,
+    LEVERAGE,
+    PAPER_CAPITAL_USDT,
+    SYMBOL,
+    WAKEUP_OFFSET_MINUTES,
+)
 
 from src.data.bybit import fetch_candles
 from src.execution.orders import (
@@ -81,8 +94,8 @@ def setup_logging(log_file_path: Optional[str] = None) -> None:
     Configures the root logger with a UTC-timestamped formatter.
 
     Attaches a StreamHandler (stdout) always, and a TimedRotatingFileHandler
-    when log_file_path is provided. Log files rotate daily and the last 30
-    days are kept, after which older files are deleted automatically.
+    when log_file_path is provided. Log files rotate at midnight UTC and are
+    kept indefinitely — the log directory is the complete historical record.
 
     Args:
         log_file_path: Optional absolute path to the log file. When None, only
@@ -104,12 +117,14 @@ def setup_logging(log_file_path: Optional[str] = None) -> None:
             log_file_path,
             when="midnight",
             utc=True,
-            backupCount=30,
+            backupCount=0,   # keep all rotated files — logs are the audit trail
             encoding="utf-8",
         )
         file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
 
+
+# ── Schedule ──────────────────────────────────────────────────────────────────
 
 def _compute_next_wakeup() -> datetime:
     """
@@ -134,13 +149,12 @@ def _query_tp_sl_close(pos: Dict) -> Optional[Dict]:
     """
     Queries execution history to identify which leg (TP or SL) fired and the fill price.
 
-    Finds the closing execution that occurred after the entry timestamp, compares the
-    fill price to the stored TP and SL reference levels (whichever is closer determines
-    the leg), and computes the realised P&L.
+    Finds the closing execution after the entry timestamp, compares the fill price
+    to the stored TP and SL reference levels (whichever is closer), and computes
+    realised P&L.
 
     Args:
-        pos: Active position dict from state.py (must include direction, entry_time_utc,
-             entry_price, tp_price, sl_price, position_notional, margin_usdt).
+        pos: Active position dict from state.py.
 
     Returns:
         Dict with keys leg ("TP"/"SL"), fill_price, pnl_usdt, pnl_pct; or None on failure.
@@ -158,16 +172,11 @@ def _query_tp_sl_close(pos: Dict) -> Optional[Dict]:
             return None
 
         fill_price = float(execution["execPrice"])
-
         tp_dist = abs(fill_price - pos["tp_price"])
         sl_dist = abs(fill_price - pos["sl_price"])
         leg = "TP" if tp_dist < sl_dist else "SL"
 
-        return {
-            "leg":        leg,
-            "fill_price": fill_price,
-            **_compute_pnl(pos, fill_price),
-        }
+        return {"leg": leg, "fill_price": fill_price, **_compute_pnl(pos, fill_price)}
 
     except Exception as exc:
         logger.warning(f"[CLOSE_DETAILS] Failed to query execution history: {exc}")
@@ -178,14 +187,11 @@ def _query_time_exit_fill(close_order_id: str) -> Optional[float]:
     """
     Returns the average fill price of a market close order placed by the engine.
 
-    Queries order status for the given order ID and extracts avgPrice. Falls back
-    to computing price from cumExecValue / cumExecQty if avgPrice is absent.
-
     Args:
         close_order_id: Bybit order ID returned by close_position_market().
 
     Returns:
-        Fill price in USDT, or None if the query fails or the order is not yet filled.
+        Fill price in USDT, or None if the query fails or order not yet filled.
     """
     try:
         order = get_order_status(close_order_id)
@@ -212,7 +218,7 @@ def _compute_pnl(pos: Dict, fill_price: float) -> Dict:
     Args:
         pos:        Position state dict with direction, entry_price,
                     position_notional, and margin_usdt.
-        fill_price: Actual close fill price in USDT.
+        fill_price: Actual (or simulated) close fill price in USDT.
 
     Returns:
         Dict with pnl_usdt and pnl_pct keys.
@@ -232,6 +238,10 @@ def _compute_pnl(pos: Dict, fill_price: float) -> Dict:
 
 # ── Notification message builders ─────────────────────────────────────────────
 
+def _paper_wrap(message: str) -> str:
+    return f"<i>[PAPER MODE — no real funds]</i>\n{message}"
+
+
 def _fmt_trade_opened(
     direction: str,
     tier: int,
@@ -239,11 +249,11 @@ def _fmt_trade_opened(
     qty_btc: float,
     sizing: Dict,
     exit_deadline: datetime,
+    paper_mode: bool = False,
 ) -> str:
-    """Builds the TRADE_OPENED Telegram message."""
     tp_sign = "+" if direction == "long" else "-"
     sl_sign = "-" if direction == "long" else "+"
-    return (
+    msg = (
         f"<b>TRADE OPENED</b>\n"
         f"{direction.upper()} T{tier} @ {entry_price:,.2f} USDT\n\n"
         f"Qty      : {qty_btc:.4f} BTC\n"
@@ -254,10 +264,10 @@ def _fmt_trade_opened(
         f"Window   : {sizing['hold_hours']}h — deadline "
         f"{exit_deadline.strftime('%Y-%m-%d %H:%M')} UTC"
     )
+    return _paper_wrap(msg) if paper_mode else msg
 
 
-def _fmt_trade_closed_tp_sl(pos: Dict, close: Optional[Dict]) -> str:
-    """Builds the TRADE_CLOSED (TP or SL) Telegram message."""
+def _fmt_trade_closed_tp_sl(pos: Dict, close: Optional[Dict], paper_mode: bool = False) -> str:
     opened = pos["entry_time_utc"][:16].replace("T", " ")
 
     if close:
@@ -275,17 +285,17 @@ def _fmt_trade_closed_tp_sl(pos: Dict, close: Optional[Dict]) -> str:
             f"P&L  : unavailable"
         )
 
-    return (
+    msg = (
         f"<b>TRADE CLOSED</b> — TP/SL\n"
         f"{pos['direction'].upper()} T{pos['tier']} | entry @ {pos['entry_price']:,.2f}\n\n"
         f"{detail}\n"
         f"TP ref : {pos['tp_price']:,.2f} | SL ref : {pos['sl_price']:,.2f}\n"
         f"Opened : {opened} UTC"
     )
+    return _paper_wrap(msg) if paper_mode else msg
 
 
-def _fmt_trade_closed_time(pos: Dict, fill_price: Optional[float]) -> str:
-    """Builds the TRADE_CLOSED (time exit) Telegram message."""
+def _fmt_trade_closed_time(pos: Dict, fill_price: Optional[float], paper_mode: bool = False) -> str:
     opened = pos["entry_time_utc"][:16].replace("T", " ")
 
     if fill_price is not None:
@@ -299,13 +309,14 @@ def _fmt_trade_closed_time(pos: Dict, fill_price: Optional[float]) -> str:
     else:
         pnl_line = "Fill : unavailable — check Bybit"
 
-    return (
+    msg = (
         f"<b>TRADE CLOSED</b> — TIME EXIT\n"
         f"{pos['direction'].upper()} T{pos['tier']} | entry @ {pos['entry_price']:,.2f}\n\n"
         f"{pnl_line}\n"
         f"Window : {pos['hold_hours']}h expired\n"
         f"Opened : {opened} UTC"
     )
+    return _paper_wrap(msg) if paper_mode else msg
 
 
 def _fmt_error(
@@ -314,7 +325,6 @@ def _fmt_error(
     equity: Optional[float] = None,
     peak: Optional[float] = None,
 ) -> str:
-    """Builds an ENGINE ERROR Telegram message, optionally including equity context."""
     ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
     msg = f"<b>ENGINE ERROR</b> — {label}\n\n{detail}"
 
@@ -335,18 +345,21 @@ def _handle_active_position(
     active_position: Dict,
     notifier: BaseNotifier,
     dry_run: bool,
+    paper_mode: bool = False,
+    last_close_price: Optional[float] = None,
 ) -> None:
     """
-    Manages an already-open position: reconciles with Bybit and handles exits.
-
-    Checks whether the position is still live on Bybit (TP/SL may have fired),
-    and whether the hold-window deadline has passed. Executes a market close if
-    the deadline has expired. Queries fill prices and P&L for both close paths.
+    Manages an already-open position: reconciles with Bybit (live) or simulates
+    TP/SL price checks (paper), and handles time-based exits.
 
     Args:
-        active_position: Position state dict from load_active_position().
-        notifier:        Notification backend for trade events.
-        dry_run:         When True, logs actions without executing any orders.
+        active_position:  Position state dict from load_active_position().
+        notifier:         Notification backend for trade events.
+        dry_run:          When True, logs actions without executing any orders.
+        paper_mode:       When True, skips all Bybit order/position API calls and
+                          simulates TP/SL detection using the last candle close price.
+        last_close_price: Close price of the most recent closed candle, used in
+                          paper mode to check TP/SL and compute time-exit P&L.
     """
     direction = active_position["direction"]
     tier = active_position["tier"]
@@ -354,11 +367,61 @@ def _handle_active_position(
     entry_price = active_position["entry_price"]
     deadline_str = active_position["exit_deadline_utc"]
 
+    # ── Paper mode: simulate position management without Bybit API calls ──────
+    if paper_mode:
+        if last_close_price is not None:
+            tp_price = active_position["tp_price"]
+            sl_price = active_position["sl_price"]
+
+            if direction == "long":
+                tp_hit = last_close_price >= tp_price
+                sl_hit = last_close_price <= sl_price
+            else:
+                tp_hit = last_close_price <= tp_price
+                sl_hit = last_close_price >= sl_price
+
+            if tp_hit or sl_hit:
+                leg = "TP" if tp_hit else "SL"
+                sim_fill = tp_price if tp_hit else sl_price
+                close_details = {
+                    "leg": leg,
+                    "fill_price": sim_fill,
+                    **_compute_pnl(active_position, sim_fill),
+                }
+                logger.info(
+                    f"[PAPER_CLOSE] {direction.upper()} T{tier} simulated {leg} hit. "
+                    f"fill={sim_fill:.2f}  P&L={close_details['pnl_usdt']:+.2f} USDT"
+                )
+                clear_active_position()
+                notifier.send(
+                    "TRADE_CLOSED",
+                    _fmt_trade_closed_tp_sl(active_position, close_details, paper_mode=True),
+                )
+                return
+
+        if is_deadline_passed(active_position):
+            logger.info(
+                f"[PAPER_DEADLINE] Hold window expired for {direction.upper()} T{tier}. "
+                f"Simulating time-based close."
+            )
+            clear_active_position()
+            notifier.send(
+                "TRADE_CLOSED",
+                _fmt_trade_closed_time(active_position, last_close_price, paper_mode=True),
+            )
+            return
+
+        remaining = datetime.fromisoformat(deadline_str) - datetime.now(tz=timezone.utc)
+        logger.info(
+            f"[PAPER_HOLDING] {direction.upper()} T{tier} @ {entry_price:.2f} | "
+            f"deadline in {remaining.total_seconds()/3600:.1f}h ({deadline_str})"
+        )
+        return
+
+    # ── Live mode: reconcile with Bybit ───────────────────────────────────────
     bybit_position = get_open_position(symbol=SYMBOL)
 
     if bybit_position is None:
-        # Position gone from Bybit — TP or SL was triggered server-side.
-        # Query execution history to identify the leg and compute P&L.
         close_details = _query_tp_sl_close(active_position)
 
         if close_details:
@@ -380,7 +443,6 @@ def _handle_active_position(
         notifier.send("TRADE_CLOSED", _fmt_trade_closed_tp_sl(active_position, close_details))
         return
 
-    # Position still open — check whether the hold-window deadline has passed
     if is_deadline_passed(active_position):
         logger.info(
             f"[DEADLINE] Hold window expired for {direction.upper()} T{tier} "
@@ -409,46 +471,56 @@ def _handle_active_position(
         notifier.send("TRADE_CLOSED", _fmt_trade_closed_time(active_position, fill_price))
         return
 
-    # Position open and deadline not yet reached — nothing to do this cycle
     remaining = datetime.fromisoformat(deadline_str) - datetime.now(tz=timezone.utc)
-    remaining_hours = remaining.total_seconds() / 3600.0
     logger.info(
         f"[HOLDING] {direction.upper()} T{tier} @ {entry_price:.2f} | "
-        f"deadline in {remaining_hours:.1f}h ({deadline_str})"
+        f"deadline in {remaining.total_seconds()/3600:.1f}h ({deadline_str})"
     )
 
 
 # ── Main cycle ────────────────────────────────────────────────────────────────
 
-def run_once(notifier: BaseNotifier, dry_run: bool = False) -> None:
+def run_once(
+    notifier: BaseNotifier,
+    dry_run: bool = False,
+    paper_mode: bool = False,
+) -> None:
     """
     Executes one full detection and execution cycle.
 
-    Fetches candles, computes indicators, checks active position state,
-    and opens a new trade if a signal is present and all risk gates pass.
-
     Args:
-        notifier: Notification backend for trade lifecycle events.
-        dry_run:  When True, runs detection and sizing but places no orders
-                  and writes no state. Useful for live-testing without capital risk.
+        notifier:   Notification backend for trade lifecycle events.
+        dry_run:    When True, runs detection and sizing but places no orders
+                    and writes no state. No notifications sent.
+        paper_mode: When True, runs the full pipeline including state writes and
+                    notifications, but places no real orders. Uses PAPER_CAPITAL_USDT
+                    for sizing. All notifications are prefixed with [PAPER].
     """
     cycle_start = datetime.now(tz=timezone.utc)
-    logger.info(f"[CYCLE_START] {cycle_start.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    mode_label = "PAPER" if paper_mode else ("DRY_RUN" if dry_run else "LIVE")
+    logger.info(f"[CYCLE_START] {cycle_start.strftime('%Y-%m-%d %H:%M:%S')} UTC  mode={mode_label}")
 
     # Step 1: Fetch candles and compute indicators
     df_raw = fetch_candles()
     df = compute_all(df_raw)
     last_candle_time = df.index[-1]
-    logger.info(f"[DATA] {len(df)} candles loaded. Last closed: {last_candle_time}")
+    last_close_price = float(df["close"].iloc[-1])
+    logger.info(f"[DATA] {len(df)} candles loaded. Last closed: {last_candle_time}  close={last_close_price:.2f}")
 
     # Step 2: Active position management
     active_position = load_active_position()
     if active_position is not None:
-        _handle_active_position(active_position, notifier, dry_run)
+        _handle_active_position(
+            active_position,
+            notifier,
+            dry_run,
+            paper_mode=paper_mode,
+            last_close_price=last_close_price,
+        )
         return
 
-    # Step 2b: Bybit-side guard — catches stale/missing local state.
-    if get_open_position(symbol=SYMBOL) is not None:
+    # Step 2b: Bybit-side position guard (live and dry-run only — paper has no real positions)
+    if not paper_mode and get_open_position(symbol=SYMBOL) is not None:
         logger.warning(
             "[POSITION_GUARD] Open position on Bybit but no local state found. "
             "Skipping new entry until the exchange position clears or is reconciled."
@@ -485,9 +557,13 @@ def run_once(notifier: BaseNotifier, dry_run: bool = False) -> None:
         f"| entry_price={entry_price:.2f}"
     )
 
-    # Step 4: Fetch live capital and compute sizing
-    capital = get_wallet_balance()
-    logger.info(f"[CAPITAL] Wallet balance: {capital:.2f} USDT")
+    # Step 4: Determine capital and compute sizing
+    if paper_mode:
+        capital = PAPER_CAPITAL_USDT
+        logger.info(f"[CAPITAL] Paper mode — using simulated capital: {capital:.2f} USDT")
+    else:
+        capital = get_wallet_balance()
+        logger.info(f"[CAPITAL] Wallet balance: {capital:.2f} USDT")
 
     sizing = compute_sizing(
         capital=capital,
@@ -511,28 +587,25 @@ def run_once(notifier: BaseNotifier, dry_run: bool = False) -> None:
         f"hold={sizing['hold_hours']}h"
     )
 
-    # Step 5: Pre-trade risk guard
-    guard_result = run_pre_trade_checks(
-        capital=capital,
-        qty_btc=qty_btc,
-        sizing=sizing,
-        leverage=LEVERAGE,
-    )
-
-    if not guard_result.ok:
-        logger.warning(f"[GUARD_BLOCK] Trade blocked — {guard_result.reason}")
-        # Include equity and peak context so the error message is immediately actionable
-        peak = load_peak_equity()
-        notifier.send(
-            "ERROR",
-            _fmt_error(
-                "GUARD_BLOCK",
-                guard_result.reason,
-                equity=capital,
-                peak=peak,
-            ),
+    # Step 5: Pre-trade risk guard (skipped in paper mode — simulated capital always passes)
+    if not paper_mode:
+        guard_result = run_pre_trade_checks(
+            capital=capital,
+            qty_btc=qty_btc,
+            sizing=sizing,
+            leverage=LEVERAGE,
         )
-        return
+
+        if not guard_result.ok:
+            logger.warning(f"[GUARD_BLOCK] Trade blocked — {guard_result.reason}")
+            peak = load_peak_equity()
+            notifier.send(
+                "ERROR",
+                _fmt_error("GUARD_BLOCK", guard_result.reason, equity=capital, peak=peak),
+            )
+            return
+    else:
+        logger.info("[PAPER_GUARD] Risk guard skipped — paper mode.")
 
     if dry_run:
         exit_deadline_dry = entry_time.to_pydatetime() + timedelta(hours=sizing["hold_hours"])
@@ -543,13 +616,12 @@ def run_once(notifier: BaseNotifier, dry_run: bool = False) -> None:
         )
         return
 
-    # Step 6: Set leverage and write pending state before placing the order.
-    # The pending state ensures the exit deadline is persisted even if the process
-    # crashes in the millisecond gap between order placement and state save.
-    set_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-
+    # Step 6: Write pending state before placing the order (or before simulating it).
     entry_time_dt = entry_time.to_pydatetime()
     exit_deadline = entry_time_dt + timedelta(hours=sizing["hold_hours"])
+
+    if not paper_mode:
+        set_leverage(symbol=SYMBOL, leverage=LEVERAGE)
 
     save_active_position(
         direction=direction,
@@ -559,35 +631,43 @@ def run_once(notifier: BaseNotifier, dry_run: bool = False) -> None:
         entry_price=entry_price,
         tp_price=sizing["tp_price"],
         sl_price=sizing["sl_price"],
-        bybit_order_id="PENDING",
+        bybit_order_id="PENDING" if not paper_mode else "PAPER",
         qty_btc=qty_btc,
         position_notional=sizing["position_notional"],
         margin_usdt=sizing["margin_usdt"],
         risk_amount_usdt=sizing["risk_amount_usdt"],
     )
     logger.info(
-        f"[PRE_ORDER_STATE] Pending state written. "
+        f"[PRE_ORDER_STATE] {'Paper' if paper_mode else 'Pending'} state written. "
         f"Exit deadline: {exit_deadline.strftime('%Y-%m-%d %H:%M')} UTC"
     )
 
-    # Step 7: Place order and patch the real order ID into state
-    try:
-        order_id = place_entry_order(
-            direction=direction,
-            qty_btc=qty_btc,
-            tp_price=sizing["tp_price"],
-            sl_price=sizing["sl_price"],
+    # Step 7: Place order (live) or simulate (paper)
+    if paper_mode:
+        order_id = "PAPER_TRADE"
+        logger.info(
+            f"[PAPER_ENTRY] Simulated {direction.upper()} T{tier} order: "
+            f"qty={qty_btc:.4f} BTC  TP={sizing['tp_price']:.2f}  SL={sizing['sl_price']:.2f}"
         )
-    except Exception:
-        clear_active_position()
-        raise
+    else:
+        try:
+            order_id = place_entry_order(
+                direction=direction,
+                qty_btc=qty_btc,
+                tp_price=sizing["tp_price"],
+                sl_price=sizing["sl_price"],
+            )
+        except Exception:
+            clear_active_position()
+            raise
+
+        logger.info(
+            f"[ENTRY] Order placed and state confirmed. "
+            f"order_id={order_id}  "
+            f"qty={qty_btc:.4f} BTC  TP={sizing['tp_price']:.2f}  SL={sizing['sl_price']:.2f}"
+        )
 
     patch_order_id(order_id)
-    logger.info(
-        f"[ENTRY] Order placed and state confirmed. "
-        f"order_id={order_id}  "
-        f"qty={qty_btc:.4f} BTC  TP={sizing['tp_price']:.2f}  SL={sizing['sl_price']:.2f}"
-    )
 
     notifier.send(
         "TRADE_OPENED",
@@ -598,23 +678,30 @@ def run_once(notifier: BaseNotifier, dry_run: bool = False) -> None:
             qty_btc=qty_btc,
             sizing=sizing,
             exit_deadline=exit_deadline,
+            paper_mode=paper_mode,
         ),
     )
 
 
-def run_forever(notifier: BaseNotifier, dry_run: bool = False) -> None:
+def run_forever(
+    notifier: BaseNotifier,
+    dry_run: bool = False,
+    paper_mode: bool = False,
+) -> None:
     """
     Blocks indefinitely, running one detection cycle at H:01 UTC each hour.
 
     Errors inside run_once() are caught and logged without stopping the loop.
 
     Args:
-        notifier: Notification backend forwarded to each run_once() call.
-        dry_run:  When True, forwarded to run_once() — no orders are placed.
+        notifier:   Notification backend forwarded to each run_once() call.
+        dry_run:    When True, forwarded to run_once() — no orders placed, no notifications.
+        paper_mode: When True, forwarded to run_once() — full pipeline with simulated trades.
     """
+    mode_label = "PAPER" if paper_mode else ("DRY_RUN" if dry_run else "LIVE")
     logger.info(
         f"[ENGINE_START] Trading engine started. "
-        f"symbol={SYMBOL}  leverage={LEVERAGE}x  dry_run={dry_run}"
+        f"symbol={SYMBOL}  leverage={LEVERAGE}x  mode={mode_label}"
     )
 
     while True:
@@ -628,7 +715,7 @@ def run_forever(notifier: BaseNotifier, dry_run: bool = False) -> None:
         time.sleep(max(sleep_seconds, 0))
 
         try:
-            run_once(notifier=notifier, dry_run=dry_run)
+            run_once(notifier=notifier, dry_run=dry_run, paper_mode=paper_mode)
         except Exception as cycle_error:
             logger.error(
                 f"[CYCLE_ERROR] Unhandled exception in run_once(): {cycle_error}",

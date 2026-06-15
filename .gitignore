@@ -1,10 +1,12 @@
 # Secrets
 .env
 
-# Runtime state and logs
+# Runtime directories (created automatically on startup)
 state/
 logs/
-data/*.parquet
+
+# Research / backtest data — not used by the live engine
+/data/
 
 # Python
 __pycache__/
