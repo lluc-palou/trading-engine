@@ -115,6 +115,7 @@ def set_leverage(symbol: str = SYMBOL, leverage: int = LEVERAGE) -> None:
             "buyLeverage": str(leverage),
             "sellLeverage": str(leverage),
         },
+        retry_network_errors=True,
     )
 
 
@@ -234,6 +235,7 @@ def cancel_all_active_orders(symbol: str = SYMBOL, timeout: int = 10) -> None:
             "symbol":   symbol,
         },
         timeout=timeout,
+        retry_network_errors=True,
     )
 
 

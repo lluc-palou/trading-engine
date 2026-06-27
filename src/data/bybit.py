@@ -5,6 +5,8 @@ fetch_candles() returns the last 1000 closed 1H candles, which is everything
 the signal detection pipeline needs. Called once per hourly cycle.
 """
 
+import logging
+import time
 from typing import List
 
 import pandas as pd
@@ -12,10 +14,19 @@ import requests
 
 from config import BYBIT_BASE_URL, CATEGORY, INTERVAL, INTERVAL_MS, SYMBOL
 
+logger = logging.getLogger(__name__)
+
 BYBIT_KLINES_URL: str = f"{BYBIT_BASE_URL}/v5/market/kline"
 
 # Request one extra candle so the forming (unclosed) candle can be identified and dropped.
 FETCH_LIMIT: int = 1001
+
+# Bybit retCode for "too many visits" — transient rate-limit hit, safe to retry
+_RATE_LIMIT_RET_CODE: int = 10006
+
+# Retry policy for transient failures — this is a read-only GET, always safe to retry
+_MAX_ATTEMPTS: int = 3
+_RETRY_BACKOFF_SECONDS: tuple = (2, 5)
 
 _BYBIT_COL_START_TIME: int = 0
 _BYBIT_COL_OPEN: int = 1
@@ -92,23 +103,51 @@ def fetch_candles(limit: int = FETCH_LIMIT, timeout: int = 10) -> pd.DataFrame:
         requests.ConnectionError: On network failure.
         ValueError: If the Bybit API returns a non-zero retCode.
     """
-    response = requests.get(
-        BYBIT_KLINES_URL,
-        params={
-            "category": CATEGORY,
-            "symbol":   SYMBOL,
-            "interval": INTERVAL,
-            "limit":    limit,
-        },
-        timeout=timeout,
-    )
-    response.raise_for_status()
+    params = {
+        "category": CATEGORY,
+        "symbol":   SYMBOL,
+        "interval": INTERVAL,
+        "limit":    limit,
+    }
 
-    payload = response.json()
-    if payload.get("retCode", -1) != 0:
-        raise ValueError(
-            f"Bybit API error {payload.get('retCode')}: {payload.get('retMsg')}"
-        )
+    last_error: Exception = RuntimeError("unreachable")
+    payload = None
+
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            response = requests.get(BYBIT_KLINES_URL, params=params, timeout=timeout)
+            response.raise_for_status()
+            candidate = response.json()
+
+            ret_code = candidate.get("retCode", -1)
+            if ret_code == _RATE_LIMIT_RET_CODE and attempt < _MAX_ATTEMPTS:
+                wait_seconds = _RETRY_BACKOFF_SECONDS[attempt - 1]
+                logger.warning(
+                    f"[fetch_candles] Bybit rate limit hit (retCode=10006). "
+                    f"Retrying in {wait_seconds}s (attempt {attempt}/{_MAX_ATTEMPTS})."
+                )
+                time.sleep(wait_seconds)
+                continue
+            if ret_code != 0:
+                raise ValueError(f"Bybit API error {ret_code}: {candidate.get('retMsg')}")
+
+            payload = candidate
+            break
+
+        except (requests.ConnectionError, requests.Timeout) as network_error:
+            last_error = network_error
+            if attempt < _MAX_ATTEMPTS:
+                wait_seconds = _RETRY_BACKOFF_SECONDS[attempt - 1]
+                logger.warning(
+                    f"[fetch_candles] Network error: {network_error}. "
+                    f"Retrying in {wait_seconds}s (attempt {attempt}/{_MAX_ATTEMPTS})."
+                )
+                time.sleep(wait_seconds)
+                continue
+            raise
+
+    if payload is None:
+        raise last_error
 
     df = _parse_kline_response(payload["result"]["list"])
 
